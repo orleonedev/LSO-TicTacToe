@@ -2,8 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
-#include "../common/include/common.h"
+#include "../common/include/utils.h"
+#include "../common/include/datastructures.h"
 
 /**
  * @brief Main function for the client.
@@ -23,7 +25,7 @@ int main(int argc, char *argv[]) {
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
-        perror("socket");
+        perror("Socket creation failed");
         exit(EXIT_FAILURE);
     }
 
@@ -38,15 +40,49 @@ int main(int argc, char *argv[]) {
     }
 
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("connect");
+        perror("connect failure");
         exit(EXIT_FAILURE);
     }
 
     printf("Connected to server\n");
+    
 
-    // TODO: Implement client logic (e.g., send/receive messages, game interaction)
+    char buffer[1024];
+    while (1) {
+        printf("Enter message (type 'quit' to exit): ");
+        if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
+            printf("Input error.\n");
+            break;
+        }
+        // Remove newline character
+        buffer[strcspn(buffer, "\n")] = 0;
+
+        if (strcmp(buffer, "quit") == 0) {
+            printf("Quitting...\n");
+            if (send(sock, buffer, strlen(buffer), 0) < 0) {
+                perror("send");
+                break;
+            }
+            break;
+        }
+
+        if (send(sock, buffer, strlen(buffer), 0) < 0) {
+            perror("send");
+            break;
+        }
+
+        int bytes_received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (bytes_received < 0) {
+            perror("recv");
+            break;
+        } else if (bytes_received == 0) {
+            printf("Server closed connection.\n");
+            break;
+        }
+        buffer[bytes_received] = '\0';
+        printf("Server: %s\n", buffer);
+    }
 
     close(sock);
-
     return 0;
 }

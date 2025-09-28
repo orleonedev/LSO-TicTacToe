@@ -2,24 +2,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include "../common/include/common.h"
+#include "../common/include/utils.h"
+#include "../common/include/datastructures.h"
 #include "thread_logic.h"
-
-/**
- * @brief Initializes the server state.
- *
- * @param state The server state to initialize.
- */
-void init_server_state(ServerState *state) {
-    state->players = NULL;
-    state->player_count = 0;
-    state->matches = NULL;
-    state->match_count = 0;
-    pthread_mutex_init(&state->players_mutex, NULL);
-    pthread_mutex_init(&state->matches_mutex, NULL);
-}
 
 /**
  * @brief Main function for the server.
@@ -35,21 +23,29 @@ int main(int argc, char *argv[]) {
     }
 
     int port = atoi(argv[1]);
-    int server_fd, new_socket;
+    int server_fd;
     struct sockaddr_in address;
     int opt = 1;
-    int addrlen = sizeof(address);
 
-    ServerState server_state;
-    init_server_state(&server_state);
+    ServerState *server_state = malloc(sizeof(ServerState));
+    if (!server_state) {
+        perror("Failed to allocate server state");
+        return EXIT_FAILURE;
+    }
+    server_state->player_head = NULL;
+    server_state->game_head = NULL;
+    pthread_mutex_init(&server_state->player_mutex, NULL);
+    pthread_mutex_init(&server_state->game_mutex, NULL);
 
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("socket failed");
+        free(server_state);
         exit(EXIT_FAILURE);
     }
 
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
         perror("setsockopt");
+        free(server_state);
         exit(EXIT_FAILURE);
     }
 
@@ -59,34 +55,45 @@ int main(int argc, char *argv[]) {
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind failed");
+        free(server_state);
         exit(EXIT_FAILURE);
     }
 
-    if (listen(server_fd, 3) < 0) {
+    if (listen(server_fd, 10) < 0) {
         perror("listen");
+        free(server_state);
         exit(EXIT_FAILURE);
     }
 
     printf("Server listening on port %d\n", port);
 
-    while ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen))) {
-        printf("New connection accepted\n");
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_sd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
 
-        pthread_t thread_id;
-        ClientThreadArgs *thread_args = malloc(sizeof(ClientThreadArgs));
-        thread_args->socket = new_socket;
-        thread_args->server_state = &server_state;
+        if (client_sd < 0) {
+            perror("Accept failed");
+            continue;
+        }
 
-        if (pthread_create(&thread_id, NULL, client_thread_handler, (void *)thread_args) < 0) {
-            perror("could not create thread");
-            return 1;
+        printf("Nuova connessione accettata.\n");
+
+        ClientThreadArgs *args = malloc(sizeof(ClientThreadArgs));
+        args->server_state = server_state;
+        args->client_sd = client_sd;
+        
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, client_thread_handler, (void *)args) != 0) {
+            perror("Failed to create thread");
+            close(client_sd);
+            free(args);
         }
     }
 
-    if (new_socket < 0) {
-        perror("accept");
-        exit(EXIT_FAILURE);
-    }
+    // Cleanup (in un'implementazione reale)
+    close(server_fd);
+    free(server_state);
 
     return 0;
 }

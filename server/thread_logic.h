@@ -1,11 +1,12 @@
 #ifndef THREAD_LOGIC_H
 #define THREAD_LOGIC_H
 
-#include "../common/include/common.h"
+#include "../common/include/utils.h"
+#include "../common/include/datastructures.h"
 
 // Arguments for the client thread handler
 typedef struct {
-    int socket;
+    int client_sd;
     ServerState *server_state;
 } ClientThreadArgs;
 
