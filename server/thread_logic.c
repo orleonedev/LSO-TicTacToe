@@ -31,6 +31,7 @@ GameNode* find_game_by_id(ServerState *state, int id);
 void cleanup_game(ServerState *state, int game_id);
 void broadcast_lobby_update(ServerState *state, PlayerNode *exclude_player);
 void process_next_challenger(ServerState *state, GameNode *game);
+void handle_create_game_fallback(int client_sd, ServerState *state, PlayerNode *myself);
 
 // --- Main Thread Handler ---
 void *client_thread_handler(void *arg) {
@@ -786,36 +787,67 @@ void handle_play_again(int client_sd, ServerState *state, PlayerNode *myself) {
     int choice;
     recv(client_sd, &choice, sizeof(int), 0);
     
+    pthread_mutex_lock(&state->game_mutex);
+    GameNode *game = find_game_by_id(state, myself->current_game_id);
+    
+    if (!game) {
+        // Game already gone?
+        pthread_mutex_unlock(&state->game_mutex);
+        if (choice == 1) {
+            // Create New
+            handle_create_game_fallback(client_sd, state, myself); // Need to define or inline this logic
+        } else {
+            myself->status = IN_LOBBY;
+            myself->current_game_id = -1;
+        }
+        return;
+    }
+
+    // Identify Role
+    int is_owner = (game->owner_sd == myself->client_sd);
+    int is_opponent = (game->opponent_sd == myself->client_sd);
+
     if (choice == 1) {
-        // Receive New Symbol Choice
+        // YES: Play Again
         char new_symbol;
         recv(client_sd, &new_symbol, sizeof(char), 0);
-
-        // Recycle Game Logic
-        pthread_mutex_lock(&state->game_mutex);
         
-        // Check if I already have a recycled game (or create new if not found)
-        GameNode *game = find_game_by_id(state, myself->current_game_id);
-        
-        if (game) {
-            // RECYCLE EXISTING
-            printf("[Game] Recycling Game ID %d for Winner '%s' (New Symbol: %c)\n", game->game_id, myself->name, new_symbol);
-            
-            // Reset Game State
-            strncpy(game->owner_name, myself->name, MAX_NAME_PLAYER);
-            game->owner_sd = myself->client_sd;
-            game->owner_symbol = new_symbol; 
-            game->opponent_sd = -1;
-            memset(game->opponent_name, 0, MAX_NAME_PLAYER);
+        if (is_owner) {
+            // Owner recycles their own game
+            printf("[Game] Owner '%s' recycling Game ID %d\n", myself->name, game->game_id);
             game->status = WAITING;
-            
+            game->owner_symbol = new_symbol;
+            game->opponent_sd = -1; // Clear opponent (they left or are creating new)
+            memset(game->opponent_name, 0, MAX_NAME_PLAYER);
             memset(game->board, ' ', 9);
+            // Ensure queue is empty? It should be empty after game start.
             
             myself->symbol = new_symbol;
-            myself->status = IN_GAME; // Technically waiting
+            myself->status = IN_GAME;
             
         } else {
-            // Fallback: Create New if game was somehow deleted
+            // Opponent (or Swapped Winner)
+            // Spec: "If both say Yes, two separate new games".
+            // So Opponent LEAVES this game and creates a NEW one.
+            printf("[Game] Player '%s' leaving Game ID %d to create new game\n", myself->name, game->game_id);
+            
+            if (is_opponent) game->opponent_sd = -1;
+            
+            // Check if we should delete old game (if owner also left)
+            if (game->owner_sd == -1 && game->opponent_sd == -1) {
+                 // Remove game
+                 GameNode **curr = &state->game_head;
+                 while(*curr) {
+                     if (*curr == game) {
+                         *curr = game->next;
+                         free(game);
+                         break;
+                     }
+                     curr = &(*curr)->next;
+                 }
+            }
+
+            // Create NEW Game
             GameNode *new_game = malloc(sizeof(GameNode));
             new_game->game_id = state->next_game_id++;
             strncpy(new_game->owner_name, myself->name, MAX_NAME_PLAYER);
@@ -835,18 +867,19 @@ void handle_play_again(int client_sd, ServerState *state, PlayerNode *myself) {
         }
 
         pthread_mutex_unlock(&state->game_mutex);
-
-        send_packet(client_sd, RSP_OK, "Game Recycled. Waiting...", 25);
+        send_packet(client_sd, RSP_OK, "Game Ready", 11);
         broadcast_lobby_update(state, myself);
 
     } else {
-        // If I say NO, I must DELETE the game if I was the "owner" (or last man standing)
-        // Actually, if I won, the game is FINISHED.
-        // If I leave, it should be removed.
-        pthread_mutex_lock(&state->game_mutex);
-        GameNode *game = find_game_by_id(state, myself->current_game_id);
-        if (game) {
-             // Remove game from list
+        // NO: Return to Lobby
+        printf("[Game] Player '%s' leaving Game ID %d\n", myself->name, game->game_id);
+
+        if (is_owner) game->owner_sd = -1;
+        if (is_opponent) game->opponent_sd = -1;
+        
+        // Check Delete
+        if (game->owner_sd == -1 && game->opponent_sd == -1) {
+             printf("[Game] Deleting empty Game ID %d\n", game->game_id);
              GameNode **curr = &state->game_head;
              while(*curr) {
                  if (*curr == game) {
@@ -857,8 +890,9 @@ void handle_play_again(int client_sd, ServerState *state, PlayerNode *myself) {
                  curr = &(*curr)->next;
              }
         }
+        
         pthread_mutex_unlock(&state->game_mutex);
-
+        
         myself->status = IN_LOBBY;
         myself->current_game_id = -1;
     }
@@ -871,4 +905,33 @@ GameNode* find_game_by_id(ServerState *state, int id) {
         curr = curr->next;
     }
     return NULL;
+}
+
+// Helper for fallback creation
+void handle_create_game_fallback(int client_sd, ServerState *state, PlayerNode *myself) {
+    // Receive Symbol as expected by flow
+    char new_symbol;
+    recv(client_sd, &new_symbol, sizeof(char), 0);
+    
+    pthread_mutex_lock(&state->game_mutex);
+    GameNode *new_game = malloc(sizeof(GameNode));
+    new_game->game_id = state->next_game_id++;
+    strncpy(new_game->owner_name, myself->name, MAX_NAME_PLAYER);
+    new_game->owner_sd = myself->client_sd;
+    new_game->owner_symbol = new_symbol;
+    new_game->opponent_sd = -1;
+    new_game->status = WAITING;
+    new_game->challenger_queue_head = NULL;
+    new_game->challenger_queue_tail = NULL;
+    memset(new_game->board, ' ', 9);
+    new_game->next = state->game_head;
+    state->game_head = new_game;
+    
+    myself->current_game_id = new_game->game_id;
+    myself->symbol = new_symbol;
+    myself->status = IN_GAME;
+    pthread_mutex_unlock(&state->game_mutex);
+    
+    send_packet(client_sd, RSP_OK, "Game Created", 13);
+    broadcast_lobby_update(state, myself);
 }

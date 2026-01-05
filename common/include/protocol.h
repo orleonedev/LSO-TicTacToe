@@ -57,7 +57,7 @@ typedef struct {
     int id;
     char owner[MAX_NAME_PLAYER];
     char opponent[MAX_NAME_PLAYER]; // Can be empty if waiting
-    char status[20]; // "WAITING", "RUNNING"
+    char status[20]; // "WAITING", "RUNNING", "FINISHED"
 } GameInfoDTO; // Data Transfer Object for sending game list
 
 #endif // PROTOCOL_H
