@@ -23,7 +23,11 @@ typedef enum {
     RSP_OPPONENT_MOVE,  // Payload: int cell_index
     RSP_GAME_OVER,      // Payload: int result (0=Draw, 1=You Won, 2=You Lost)
     RSP_ASK_PLAY_AGAIN, // Payload: None
-    RSP_SHUTDOWN        // Payload: Server shutting down
+    RSP_SHUTDOWN,       // Payload: Server shutting down
+    RSP_LOBBY_UPDATE,   // Payload: None (Triggers refresh) or GameInfo
+    RSP_JOIN_REQUEST,   // Payload: Challenger Name
+    CMD_HOST_DECISION,  // Payload: int decision (1=Yes, 0=No)
+    RSP_REQUEST_RESULT  // Payload: int accepted (1=Yes, 0=No), char msg[]
 } MessageType;
 
 // Standard Network Packet Header

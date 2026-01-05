@@ -27,7 +27,10 @@ typedef enum {
     MSG_GAME_OVER,        // Payload: Result (Win/Loss/Draw)
     MSG_OPPONENT_QUIT,    // Opponent disconnected
     MSG_SHUTDOWN,         // Server is stopping
-    MSG_ASK_NEW_HOST      // Ask player if they want to stay as host
+    MSG_ASK_NEW_HOST,     // Ask player if they want to stay as host
+    MSG_LOBBY_UPDATE,     // Inform lobby players of new game
+    MSG_JOIN_REQUEST,     // Ask Host to accept/reject
+    MSG_REQUEST_RESULT    // Tell Challenger if accepted/rejected
 } InternalMsgType;
 
 typedef struct {
@@ -67,12 +70,25 @@ typedef struct GameNode {
     int opponent_sd;
     char opponent_symbol;
 
+    // Queue for players waiting to join this game
+    // Simple linked list of names or SDs? Better store simplified info or PlayerNode pointers?
+    // Storing PlayerNode* is risky if they disconnect.
+    // Let's store a separate Queue Node structure.
+    struct ChallengerNode *challenger_queue_head;
+    struct ChallengerNode *challenger_queue_tail;
+
     char board[3][3]; // ' ', 'X', 'O'
     int current_turn_sd; // socket descriptor of the player who needs to move
 
     GameStatus status;
     struct GameNode *next;
 } GameNode;
+
+typedef struct ChallengerNode {
+    int client_sd;
+    char name[MAX_NAME_PLAYER];
+    struct ChallengerNode *next;
+} ChallengerNode;
 
 // Struttura che incapsula lo stato condiviso del server
 typedef struct {

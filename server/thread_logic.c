@@ -20,6 +20,7 @@ void handle_list_games(int client_sd, ServerState *state);
 void handle_move(int client_sd, ServerState *state, PlayerNode *myself);
 void handle_disconnect(ServerState *state, PlayerNode *myself);
 void handle_play_again(int client_sd, ServerState *state, PlayerNode *myself);
+void handle_host_decision(int client_sd, ServerState *state, PlayerNode *myself);
 
 // Utilities
 void send_packet(int sd, MessageType type, const void *payload, int payload_size);
@@ -28,6 +29,8 @@ PlayerNode* create_player_node(const char* name, int sd);
 void remove_player(ServerState *state, PlayerNode *player);
 GameNode* find_game_by_id(ServerState *state, int id);
 void cleanup_game(ServerState *state, int game_id);
+void broadcast_lobby_update(ServerState *state, PlayerNode *exclude_player);
+void process_next_challenger(ServerState *state, GameNode *game);
 
 // --- Main Thread Handler ---
 void *client_thread_handler(void *arg) {
@@ -36,18 +39,15 @@ void *client_thread_handler(void *arg) {
     int client_sd = args->client_sd;
     free(args);
 
-    printf("Thread started for client SD: %d\n", client_sd);
+    printf("[Thread] Started for client SD: %d\n", client_sd);
 
     PlayerNode *myself = NULL;
 
     // 1. Registration Phase (Synchronous)
-    // The client MUST send a LOGIN packet first.
-    // We can use a small timeout or just block for simplicity as per requirements "Upon connection... sends username".
-    
     handle_login(client_sd, state, &myself);
 
     if (!myself) {
-        // Login failed or disconnected
+        printf("[Thread] Login failed or disconnected for SD: %d\n", client_sd);
         close(client_sd);
         pthread_exit(NULL);
     }
@@ -56,6 +56,8 @@ void *client_thread_handler(void *arg) {
     fd_set read_fds;
     int max_fd;
     int pipe_read_fd = myself->pipe_fd[0];
+
+    printf("[Loop] Entering main loop for player: %s\n", myself->name);
 
     while (1) {
         FD_ZERO(&read_fds);
@@ -79,13 +81,10 @@ void *client_thread_handler(void *arg) {
 
         // Check Network Messages (Socket)
         if (FD_ISSET(client_sd, &read_fds)) {
-            // Peek or Read header first? 
-            // We'll read the header in handle_client_message
-            // If read returns 0 (disconnect), we handle it.
             PacketHeader header;
             ssize_t bytes = recv(client_sd, &header, sizeof(header), MSG_PEEK);
             if (bytes <= 0) {
-                printf("Client %s disconnected (socket closed).\n", myself->name);
+                printf("[Disconnect] Client %s disconnected (socket closed).\n", myself->name);
                 handle_disconnect(state, myself);
                 break;
             }
@@ -94,9 +93,7 @@ void *client_thread_handler(void *arg) {
         }
     }
 
-    // Cleanup ensures player is removed if loop breaks
-    // handle_disconnect should handle list removal.
-    close(client_sd); // Ensure closed
+    close(client_sd); 
     pthread_exit(NULL);
 }
 
@@ -119,6 +116,7 @@ void send_packet(int sd, MessageType type, const void *payload, int payload_size
 }
 
 void send_error(int sd, const char *msg) {
+    printf("[Error] Sending error to SD %d: %s\n", sd, msg);
     send_packet(sd, RSP_ERROR, msg, strlen(msg) + 1);
 }
 
@@ -134,12 +132,15 @@ void handle_login(int client_sd, ServerState *state, PlayerNode **myself_ptr) {
     LoginRequest req;
     if (recv(client_sd, &req, header.payload_size, 0) <= 0) return;
 
+    printf("[Login] Request from SD %d: Name='%s'\n", client_sd, req.name);
+
     // Check Uniqueness
     pthread_mutex_lock(&state->player_mutex);
     PlayerNode *curr = state->player_head;
     while (curr) {
         if (strcmp(curr->name, req.name) == 0) {
             pthread_mutex_unlock(&state->player_mutex);
+            printf("[Login] Failed: Name '%s' already taken.\n", req.name);
             send_error(client_sd, "Name taken");
             return;
         }
@@ -154,7 +155,7 @@ void handle_login(int client_sd, ServerState *state, PlayerNode **myself_ptr) {
 
     *myself_ptr = new_node;
     send_packet(client_sd, RSP_OK, "Welcome", 8);
-    printf("Player %s logged in.\n", req.name);
+    printf("[Login] Success: Player '%s' logged in.\n", req.name);
 }
 
 PlayerNode* create_player_node(const char* name, int sd) {
@@ -178,8 +179,6 @@ void handle_client_message(int client_sd, ServerState *state, PlayerNode *myself
 
     // Validate payload size safety (basic check)
     if (header.payload_size > 1024) {
-         // Prevent buffer overflow attacks
-         // consume bytes
          return; 
     }
 
@@ -194,10 +193,14 @@ void handle_client_message(int client_sd, ServerState *state, PlayerNode *myself
         case CMD_JOIN_GAME:
             handle_join_game(client_sd, state, myself);
             break;
+        case CMD_HOST_DECISION:
+            handle_host_decision(client_sd, state, myself);
+            break;
         case CMD_MOVE:
             handle_move(client_sd, state, myself);
             break;
         case CMD_DISCONNECT:
+            printf("[Action] Player '%s' requested disconnect.\n", myself->name);
             handle_disconnect(state, myself);
             pthread_exit(NULL);
             break;
@@ -205,35 +208,47 @@ void handle_client_message(int client_sd, ServerState *state, PlayerNode *myself
             handle_play_again(client_sd, state, myself);
             break;
         default:
-            printf("Unknown command from %s\n", myself->name);
+            printf("[Warning] Unknown command type %d from %s\n", header.type, myself->name);
             break;
     }
 }
 
-void handle_list_games(int client_sd, ServerState *state) {
-    // We send a series of GameInfoDTOs, or a count first.
-    // Let's send a custom packed response: [Count] [Game1] [Game2]...
-    // Or simpler: Send RSP_GAME_LIST with a large payload.
-    // For simplicity, let's send them one by one or just one large buffer.
-    // Given the constraints, let's just send the count first (as payload of RSP_GAME_LIST) 
-    // and then individual packets? No, spec says RSP_GAME_LIST.
+void broadcast_lobby_update(ServerState *state, PlayerNode *exclude_player) {
+    pthread_mutex_lock(&state->player_mutex);
+    PlayerNode *curr = state->player_head;
+    InternalMessage msg;
+    msg.type = MSG_LOBBY_UPDATE;
     
+    while(curr) {
+        if (curr != exclude_player && curr->status == IN_LOBBY) {
+            write(curr->pipe_fd[1], &msg, sizeof(msg));
+        }
+        curr = curr->next;
+    }
+    pthread_mutex_unlock(&state->player_mutex);
+}
+
+void handle_list_games(int client_sd, ServerState *state) {
     pthread_mutex_lock(&state->game_mutex);
     
     int count = 0;
     GameNode *curr = state->game_head;
-    while(curr) { count++; curr = curr->next; }
+    while(curr) { 
+        if (curr->status != FINISHED) {
+            count++; 
+        }
+        curr = curr->next; 
+    }
 
-    // Send Count first? Or construct a big buffer.
-    // Let's assume max 20 games for buffer simplicity? 
-    // Better: Send payload containing Count, then Loop sending data.
-    // Protocol definition said "List of games (custom serialization)".
-    
-    // Let's send a RSP_GAME_LIST with payload = int count
     send_packet(client_sd, RSP_GAME_LIST, &count, sizeof(int));
 
     curr = state->game_head;
     while(curr) {
+        if (curr->status == FINISHED) {
+             curr = curr->next;
+             continue;
+        }
+
         GameInfoDTO dto;
         dto.id = curr->game_id;
         strncpy(dto.owner, curr->owner_name, MAX_NAME_PLAYER);
@@ -262,136 +277,289 @@ void handle_create_game(int client_sd, ServerState *state, PlayerNode *myself) {
     new_game->owner_symbol = req.symbol; // 'X' or 'O'
     new_game->opponent_sd = -1;
     new_game->status = WAITING;
+    new_game->challenger_queue_head = NULL;
+    new_game->challenger_queue_tail = NULL;
     memset(new_game->board, ' ', 9);
     new_game->next = state->game_head;
     state->game_head = new_game;
     
     myself->current_game_id = new_game->game_id;
     myself->symbol = req.symbol;
-    myself->status = IN_GAME;
+    myself->status = IN_GAME; // Technically waiting in game
+
+    printf("[Game] Created Game ID %d by '%s' (Symbol: %c)\n", new_game->game_id, myself->name, req.symbol);
 
     pthread_mutex_unlock(&state->game_mutex);
 
     send_packet(client_sd, RSP_OK, "Game Created", 13);
+    
+    // Notify Lobby
+    broadcast_lobby_update(state, myself);
 }
 
 void handle_join_game(int client_sd, ServerState *state, PlayerNode *myself) {
     JoinGameRequest req;
     recv(client_sd, &req, sizeof(req), 0);
 
+    printf("[Game] Player '%s' requesting to join Game ID %d\n", myself->name, req.game_id);
+
     pthread_mutex_lock(&state->game_mutex);
-    GameNode *curr = state->game_head;
-    while (curr) {
-        if (curr->game_id == req.game_id) {
-            if (curr->status == WAITING) {
-                // Join success
-                curr->status = RUNNING;
-                strncpy(curr->opponent_name, myself->name, MAX_NAME_PLAYER);
-                curr->opponent_sd = myself->client_sd;
-                
-                // Assign symbol
-                curr->opponent_symbol = (curr->owner_symbol == 'X') ? 'O' : 'X';
-                myself->symbol = curr->opponent_symbol;
-                myself->current_game_id = curr->game_id;
-                myself->status = IN_GAME;
-                
-                // Determine who starts (e.g., 'X' always starts)
-                char start_symbol = 'X';
-                curr->current_turn_sd = (curr->owner_symbol == start_symbol) ? curr->owner_sd : curr->opponent_sd;
+    GameNode *game = find_game_by_id(state, req.game_id);
+    
+    if (game && game->status == WAITING) {
+        // Enqueue
+        ChallengerNode *node = malloc(sizeof(ChallengerNode));
+        node->client_sd = myself->client_sd;
+        strncpy(node->name, myself->name, MAX_NAME_PLAYER);
+        node->next = NULL;
 
-                // Notify Owner (Internal Message)
-                pthread_mutex_lock(&state->player_mutex);
-                PlayerNode *owner_node = state->player_head;
-                while(owner_node) {
-                    if (owner_node->client_sd == curr->owner_sd) {
-                        InternalMessage msg;
-                        msg.type = MSG_MATCH_FOUND;
-                        strncpy(msg.payload, myself->name, MAX_NAME_PLAYER); 
-                        write(owner_node->pipe_fd[1], &msg, sizeof(msg));
-                        break;
-                    }
-                    owner_node = owner_node->next;
-                }
-                pthread_mutex_unlock(&state->player_mutex);
-
-                // Notify Self (Network)
-                // Payload: Opponent Name + Assigned Symbol
-                // Let's repackage RSP_MATCH_FOUND payload to contain symbol
-                char buf[128];
-                snprintf(buf, sizeof(buf), "%s %c", curr->owner_name, myself->symbol);
-                send_packet(client_sd, RSP_MATCH_FOUND, buf, strlen(buf)+1);
-
-                // Send Start Notification
-                char start_msg[2] = {start_symbol, '\0'};
-                send_packet(client_sd, RSP_GAME_START, start_msg, 2);
-                
-                // Owner also needs RSP_GAME_START, handled in process_internal_message or sent here?
-                // Ideally sent by the Owner's thread when it receives MSG_MATCH_FOUND.
-                
-                pthread_mutex_unlock(&state->game_mutex);
-                return;
-            } else {
-                pthread_mutex_unlock(&state->game_mutex);
-                send_error(client_sd, "Game full or running");
-                return;
-            }
+        if (game->challenger_queue_tail) {
+            game->challenger_queue_tail->next = node;
+            game->challenger_queue_tail = node;
+        } else {
+            game->challenger_queue_head = node;
+            game->challenger_queue_tail = node;
         }
-        curr = curr->next;
+
+        // If this is the FIRST challenger, trigger Host
+        if (game->challenger_queue_head == node) {
+             process_next_challenger(state, game);
+        }
+        
+        send_packet(client_sd, RSP_OK, "Request Queued", 15);
+        
+        myself->current_game_id = game->game_id; 
+        // We do NOT set status to IN_GAME yet. Stay IN_LOBBY or add new status PENDING_JOIN?
+        // Spec says "Waiting for Host approval" state.
+        // Let's assume IN_LOBBY logic handles PENDING mostly (just waits for packets).
+        
+    } else {
+        send_error(client_sd, "Game not found or running");
     }
+    
     pthread_mutex_unlock(&state->game_mutex);
-    send_error(client_sd, "Game not found");
+}
+
+void process_next_challenger(ServerState *state, GameNode *game) {
+    // Expects game_mutex locked
+    if (!game->challenger_queue_head) return;
+
+    ChallengerNode *candidate = game->challenger_queue_head;
+    
+    // Find Host Node to notify
+    pthread_mutex_lock(&state->player_mutex);
+    PlayerNode *host_node = state->player_head;
+    while(host_node) {
+        if (host_node->client_sd == game->owner_sd) {
+            InternalMessage msg;
+            msg.type = MSG_JOIN_REQUEST;
+            strncpy(msg.payload, candidate->name, MAX_NAME_PLAYER); 
+            write(host_node->pipe_fd[1], &msg, sizeof(msg));
+            break;
+        }
+        host_node = host_node->next;
+    }
+    pthread_mutex_unlock(&state->player_mutex);
+}
+
+void handle_host_decision(int client_sd, ServerState *state, PlayerNode *myself) {
+    int accepted; // 1=Yes, 0=No
+    recv(client_sd, &accepted, sizeof(int), 0);
+    
+    pthread_mutex_lock(&state->game_mutex);
+    GameNode *game = find_game_by_id(state, myself->current_game_id);
+    
+    if (!game || !game->challenger_queue_head) {
+        pthread_mutex_unlock(&state->game_mutex);
+        return;
+    }
+
+    ChallengerNode *candidate = game->challenger_queue_head;
+    
+    // Find Candidate Player Node
+    pthread_mutex_lock(&state->player_mutex);
+    PlayerNode *candidate_node = state->player_head;
+    while(candidate_node) {
+        if (candidate_node->client_sd == candidate->client_sd) break;
+        candidate_node = candidate_node->next;
+    }
+    
+    if (accepted) {
+        printf("[Game] Host Accepted candidate %s\n", candidate->name);
+        
+        // 1. Setup Game
+        game->status = RUNNING;
+        strncpy(game->opponent_name, candidate->name, MAX_NAME_PLAYER);
+        game->opponent_sd = candidate->client_sd;
+        game->opponent_symbol = (game->owner_symbol == 'X') ? 'O' : 'X';
+        
+        char start_symbol = 'X';
+        game->current_turn_sd = (game->owner_symbol == start_symbol) ? game->owner_sd : game->opponent_sd;
+        
+        // 2. Notify Candidate (Internal)
+        if (candidate_node) {
+            // Update Candidate State
+            candidate_node->current_game_id = game->game_id;
+            candidate_node->status = IN_GAME;
+            candidate_node->symbol = game->opponent_symbol;
+
+            InternalMessage msg;
+            msg.type = MSG_REQUEST_RESULT;
+            msg.data = 1; // Accepted
+            // Payload: OwnerName OwnerSymbol(unused)
+            snprintf(msg.payload, sizeof(msg.payload), "%s %c", game->owner_name, candidate_node->symbol);
+            write(candidate_node->pipe_fd[1], &msg, sizeof(msg));
+        }
+
+        // 3. Notify Host (Self)
+        // Send RSP_GAME_START
+        char start_msg[2] = {start_symbol, '\0'};
+        send_packet(client_sd, RSP_GAME_START, start_msg, 2);
+        
+        // 4. Flush Queue (Reject others)
+        ChallengerNode *curr = game->challenger_queue_head->next; // Skip first (accepted)
+        while(curr) {
+            // Notify Rejection
+            PlayerNode *p = state->player_head;
+            while(p) {
+                if (p->client_sd == curr->client_sd) {
+                    InternalMessage msg;
+                    msg.type = MSG_REQUEST_RESULT;
+                    msg.data = 0; // Rejected
+                    write(p->pipe_fd[1], &msg, sizeof(msg));
+                    break;
+                }
+                p = p->next;
+            }
+            ChallengerNode *tmp = curr;
+            curr = curr->next;
+            free(tmp);
+        }
+        
+        free(game->challenger_queue_head);
+        game->challenger_queue_head = NULL;
+        game->challenger_queue_tail = NULL;
+        
+        // Broadcast Lobby Update (Game no longer waiting)
+        pthread_mutex_unlock(&state->player_mutex);
+        broadcast_lobby_update(state, NULL);
+
+    } else {
+        printf("[Game] Host Rejected candidate %s\n", candidate->name);
+        
+        // Notify Rejection
+        if (candidate_node) {
+            InternalMessage msg;
+            msg.type = MSG_REQUEST_RESULT;
+            msg.data = 0; // Rejected
+            write(candidate_node->pipe_fd[1], &msg, sizeof(msg));
+        }
+        
+        // Remove from Queue
+        game->challenger_queue_head = candidate->next;
+        if (!game->challenger_queue_head) game->challenger_queue_tail = NULL;
+        free(candidate);
+        
+        pthread_mutex_unlock(&state->player_mutex);
+        
+        // Process Next
+        process_next_challenger(state, game);
+    }
+
+    pthread_mutex_unlock(&state->game_mutex);
 }
 
 void handle_internal_message(PlayerNode *myself, ServerState *state) {
     InternalMessage msg;
     read(myself->pipe_fd[0], &msg, sizeof(msg));
 
+    printf("[Pipe] Player '%s' received internal msg type %d\n", myself->name, msg.type);
+
     switch (msg.type) {
+        case MSG_LOBBY_UPDATE:
+            // Trigger client refresh
+            send_packet(myself->client_sd, RSP_LOBBY_UPDATE, NULL, 0);
+            break;
+
+        case MSG_JOIN_REQUEST:
+             // Send request to Host
+             send_packet(myself->client_sd, RSP_JOIN_REQUEST, msg.payload, strlen(msg.payload)+1);
+             break;
+
+        case MSG_REQUEST_RESULT:
+             // To Challenger
+             {
+                 int accepted = msg.data;
+                 if (accepted) {
+                    // msg.payload contains "OwnerName Symbol"
+                    send_packet(myself->client_sd, RSP_MATCH_FOUND, msg.payload, strlen(msg.payload)+1);
+                    send_packet(myself->client_sd, RSP_GAME_START, "X", 2); 
+                 } else {
+                     send_packet(myself->client_sd, RSP_REQUEST_RESULT, &accepted, sizeof(int));
+                 }
+             }
+             break;
+
         case MSG_MATCH_FOUND:
-            // I am the owner, someone joined.
+             // Legacy case, not used in queue logic?
+             // Or used if we auto-match. Kept for safety.
             send_packet(myself->client_sd, RSP_MATCH_FOUND, msg.payload, strlen(msg.payload)+1);
-            // msg.payload contains opponent name.
-            // Need to tell client who starts.
-            // We know 'X' always starts.
             send_packet(myself->client_sd, RSP_GAME_START, "X", 2); 
             break;
             
         case MSG_OPPONENT_MOVE:
-            // msg.data contains the move index (0-8)
             {
                 MoveRequest move;
                 move.cell_index = msg.data;
                 send_packet(myself->client_sd, RSP_OPPONENT_MOVE, &move, sizeof(move));
-                
-                // Check if Game Over (the move logic updates state, but here we just forward)
-                // Actually, the sender of this message should have checked win condition?
-                // Or we check it shared?
-                // The requirements say "Server checks for win conditions".
-                // Usually the thread processing the MOVE (the active player) checks the win.
-                // If Win/Draw, it sends MSG_GAME_OVER to both (or RSP to self and MSG to opponent).
             }
             break;
             
         case MSG_GAME_OVER:
-            // msg.data = result (0=Draw, 1=Win, 2=Loss) - relative to receiver?
-            // Let's standardise: 1=Winner, 2=Loser.
+            // msg.data = result (1=Win, 2=Loss, 0=Draw) relative to receiver
             {
                 int res = msg.data;
                 send_packet(myself->client_sd, RSP_GAME_OVER, &res, sizeof(int));
                 
-                // Prompt for restart
-                send_packet(myself->client_sd, RSP_ASK_PLAY_AGAIN, NULL, 0);
+                if (res == 0 || res == 1) {
+                    // Draw or Win (Wait, internal msg 1=Win means I won? 
+                    // In handle_move: "msg.data = opp_res" where opp_res=2 (Loss).
+                    // So if I receive 2, I Lost.
+                    // If I receive 0, Draw.
+                    // If I receive 1, I Won. (Shouldn't happen via pipe usually unless resign?)
+                    
+                    // Let's check handle_move logic:
+                    // Win: my_res=1, opp_res=2. Pipe sends 2.
+                    // Draw: my_res=0, opp_res=0. Pipe sends 0.
+                    
+                    // So via Pipe: 
+                    // 2 (Loss) -> Return to Lobby.
+                    // 0 (Draw) -> Ask Play Again.
+                    
+                    if (res == 0) {
+                        send_packet(myself->client_sd, RSP_ASK_PLAY_AGAIN, NULL, 0);
+                    } else if (res == 2) {
+                        // Loser: Back to Lobby
+                        myself->status = IN_LOBBY;
+                        myself->current_game_id = -1;
+                    }
+                } else {
+                     // Catch-all (e.g. res=2)
+                     if (res == 2) {
+                        myself->status = IN_LOBBY;
+                        myself->current_game_id = -1;
+                     }
+                }
             }
             break;
             
         case MSG_OPPONENT_QUIT:
             send_packet(myself->client_sd, RSP_ERROR, "Opponent disconnected. You win!", 30);
-             // handle win by default logic
             myself->status = IN_LOBBY;
             myself->current_game_id = -1;
             break;
             
-default: 
+        default: 
             break;
     }
 }
@@ -424,6 +592,8 @@ int check_draw(char board[3][3]) {
 void handle_move(int client_sd, ServerState *state, PlayerNode *myself) {
     MoveRequest req;
     recv(client_sd, &req, sizeof(req), 0);
+
+    printf("[Game] Move received from '%s' at cell %d\n", myself->name, req.cell_index);
 
     pthread_mutex_lock(&state->game_mutex);
     GameNode *game = find_game_by_id(state, myself->current_game_id);
@@ -479,6 +649,7 @@ void handle_move(int client_sd, ServerState *state, PlayerNode *myself) {
         int my_res = 1; // Win
         int opp_res = 2; // Loss
         send_packet(client_sd, RSP_GAME_OVER, &my_res, sizeof(int));
+        // Winner gets asked to play again
         send_packet(client_sd, RSP_ASK_PLAY_AGAIN, NULL, 0);
 
         if (opp_node) {
@@ -491,6 +662,7 @@ void handle_move(int client_sd, ServerState *state, PlayerNode *myself) {
         game->status = FINISHED;
         int res = 0; // Draw
         send_packet(client_sd, RSP_GAME_OVER, &res, sizeof(int));
+        // Draw: Both asked
         send_packet(client_sd, RSP_ASK_PLAY_AGAIN, NULL, 0);
 
         if (opp_node) {
@@ -508,8 +680,10 @@ void handle_move(int client_sd, ServerState *state, PlayerNode *myself) {
 }
 
 void handle_disconnect(ServerState *state, PlayerNode *myself) {
-    if (!myself) return;
+    if (!myself) return; 
     
+    printf("[Disconnect] Removing player '%s'\n", myself->name);
+
     pthread_mutex_lock(&state->player_mutex);
     // Remove from list
     PlayerNode **curr = &state->player_head;
@@ -523,33 +697,168 @@ void handle_disconnect(ServerState *state, PlayerNode *myself) {
     pthread_mutex_unlock(&state->player_mutex);
 
     // Handle Active Game cleanup
-    if (myself->status == IN_GAME) {
-        // Notify opponent...
-        // This requires finding the game and the opponent.
-        // Simplified: The opponent will eventually detect closed socket or we should notify via pipe if possible.
-        // We'll leave this for robustness improvements.
+    pthread_mutex_lock(&state->game_mutex);
+    GameNode **g_curr = &state->game_head;
+    while(*g_curr) {
+        GameNode *g = *g_curr;
+        
+        // Case 1: I am the Owner
+        if (g->owner_sd == myself->client_sd) {
+            // Notify Queue
+             ChallengerNode *qn = g->challenger_queue_head;
+             while(qn) {
+                 // Find player node to send pipe message
+                 pthread_mutex_lock(&state->player_mutex);
+                 PlayerNode *p = state->player_head;
+                 while(p) {
+                     if (p->client_sd == qn->client_sd) {
+                         InternalMessage msg;
+                         msg.type = MSG_REQUEST_RESULT;
+                         msg.data = 0; // Rejected/Cancelled
+                         write(p->pipe_fd[1], &msg, sizeof(msg));
+                         break;
+                     }
+                     p = p->next;
+                 }
+                 pthread_mutex_unlock(&state->player_mutex);
+                 
+                 ChallengerNode *tmp = qn;
+                 qn = qn->next;
+                 free(tmp);
+             }
+             
+             // Notify Opponent if running
+             if (g->status == RUNNING) {
+                 pthread_mutex_lock(&state->player_mutex);
+                 PlayerNode *opp = state->player_head;
+                 while(opp) {
+                     if (opp->client_sd == g->opponent_sd) {
+                         InternalMessage msg;
+                         msg.type = MSG_OPPONENT_QUIT;
+                         write(opp->pipe_fd[1], &msg, sizeof(msg));
+                         break;
+                     }
+                     opp = opp->next;
+                 }
+                 pthread_mutex_unlock(&state->player_mutex);
+             }
+             
+            *g_curr = g->next;
+            free(g);
+            break; 
+        }
+        // Case 2: I am the Opponent
+        else if (g->opponent_sd == myself->client_sd) {
+            // Notify Owner
+             pthread_mutex_lock(&state->player_mutex);
+             PlayerNode *owner = state->player_head;
+             while(owner) {
+                 if (owner->client_sd == g->owner_sd) {
+                     InternalMessage msg;
+                     msg.type = MSG_OPPONENT_QUIT;
+                     write(owner->pipe_fd[1], &msg, sizeof(msg));
+                     break;
+                 }
+                 owner = owner->next;
+             }
+             pthread_mutex_unlock(&state->player_mutex);
+             
+             // The Owner thread will handle game cleanup/reset upon receiving MSG_OPPONENT_QUIT
+             // But we should probably mark game as FINISHED here to prevent race conditions?
+             g->status = FINISHED; 
+             
+             break;
+        }
+        
+        g_curr = &(*g_curr)->next;
     }
-    
+    pthread_mutex_unlock(&state->game_mutex);
+
     close(myself->pipe_fd[0]);
     close(myself->pipe_fd[1]);
     free(myself);
+    
+    // Broadcast Lobby Update (Player removed)
+    broadcast_lobby_update(state, NULL);
 }
 
 void handle_play_again(int client_sd, ServerState *state, PlayerNode *myself) {
-    // Read choice (1=Yes, 0=No)
-    // If Yes -> Logic to restart or host new.
-    // If No -> Lobby.
-    // Implementation of specific requirement: "Winner becomes Host", "Loser -> Lobby", "Draw -> Ask both".
-    // This requires knowing the context (was I winner/loser?). 
-    // For now, let's just reset to Lobby if No.
-    
     int choice;
     recv(client_sd, &choice, sizeof(int), 0);
     
     if (choice == 1) {
-        // Host new game logic...
-        // Reuse handle_create_game logic or similar.
+        // Receive New Symbol Choice
+        char new_symbol;
+        recv(client_sd, &new_symbol, sizeof(char), 0);
+
+        // Recycle Game Logic
+        pthread_mutex_lock(&state->game_mutex);
+        
+        // Check if I already have a recycled game (or create new if not found)
+        GameNode *game = find_game_by_id(state, myself->current_game_id);
+        
+        if (game) {
+            // RECYCLE EXISTING
+            printf("[Game] Recycling Game ID %d for Winner '%s' (New Symbol: %c)\n", game->game_id, myself->name, new_symbol);
+            
+            // Reset Game State
+            strncpy(game->owner_name, myself->name, MAX_NAME_PLAYER);
+            game->owner_sd = myself->client_sd;
+            game->owner_symbol = new_symbol; 
+            game->opponent_sd = -1;
+            memset(game->opponent_name, 0, MAX_NAME_PLAYER);
+            game->status = WAITING;
+            
+            memset(game->board, ' ', 9);
+            
+            myself->symbol = new_symbol;
+            myself->status = IN_GAME; // Technically waiting
+            
+        } else {
+            // Fallback: Create New if game was somehow deleted
+            GameNode *new_game = malloc(sizeof(GameNode));
+            new_game->game_id = state->next_game_id++;
+            strncpy(new_game->owner_name, myself->name, MAX_NAME_PLAYER);
+            new_game->owner_sd = myself->client_sd;
+            new_game->owner_symbol = new_symbol;
+            new_game->opponent_sd = -1;
+            new_game->status = WAITING;
+            new_game->challenger_queue_head = NULL;
+            new_game->challenger_queue_tail = NULL;
+            memset(new_game->board, ' ', 9);
+            new_game->next = state->game_head;
+            state->game_head = new_game;
+            
+            myself->current_game_id = new_game->game_id;
+            myself->symbol = new_symbol;
+            myself->status = IN_GAME;
+        }
+
+        pthread_mutex_unlock(&state->game_mutex);
+
+        send_packet(client_sd, RSP_OK, "Game Recycled. Waiting...", 25);
+        broadcast_lobby_update(state, myself);
+
     } else {
+        // If I say NO, I must DELETE the game if I was the "owner" (or last man standing)
+        // Actually, if I won, the game is FINISHED.
+        // If I leave, it should be removed.
+        pthread_mutex_lock(&state->game_mutex);
+        GameNode *game = find_game_by_id(state, myself->current_game_id);
+        if (game) {
+             // Remove game from list
+             GameNode **curr = &state->game_head;
+             while(*curr) {
+                 if (*curr == game) {
+                     *curr = game->next;
+                     free(game);
+                     break;
+                 }
+                 curr = &(*curr)->next;
+             }
+        }
+        pthread_mutex_unlock(&state->game_mutex);
+
         myself->status = IN_LOBBY;
         myself->current_game_id = -1;
     }
