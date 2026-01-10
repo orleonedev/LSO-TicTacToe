@@ -88,6 +88,7 @@ void clear_screen() {
 }
 
 void list_games() {
+    printf("--- LOBBY ---\n");
     send_request(CMD_LIST_GAMES, NULL, 0);
     PacketHeader header;
     recv(sock, &header, sizeof(header), 0); // Should be RSP_GAME_LIST
@@ -110,7 +111,6 @@ void handle_lobby() {
     
     // Initial List
     clear_screen();
-    printf("--- LOBBY ---\n");
     list_games();
 
     while (1) {
@@ -131,7 +131,6 @@ void handle_lobby() {
                 // Consume packet
                 recv(sock, &header, sizeof(header), 0); 
                 clear_screen();
-                printf("--- LOBBY (Updated) ---\n");
                 list_games();
             } else {
                 // Unexpected packet in lobby? Consume and ignore or error.
@@ -257,7 +256,7 @@ void handle_join_wait() {
                 printf("Host Accepted! Joining...\n");
             } else {
                 printf("Host Rejected your request.\n");
-                sleep(1);
+                sleep(3);
                 return; // Back to lobby
             }
         }
@@ -373,13 +372,14 @@ void play_match() {
                     return; // Return to lobby
                 }
             }
+            // TODO: HANDLE EVERY TYPE OF ERROR
             else if (header.type == RSP_ERROR) {
                  // Opponent quit
                  char msg[128];
                  recv(sock, msg, header.payload_size, 0);
                  printf("%s\n", msg);
                  game_over = 1;
-                 sleep(2);
+                 sleep(3);
             }
         }
 

@@ -554,11 +554,13 @@ void handle_internal_message(PlayerNode *myself, ServerState *state) {
             }
             break;
             
-        case MSG_OPPONENT_QUIT:
-            send_packet(myself->client_sd, RSP_ERROR, "Opponent disconnected. You win!", 30);
+        case MSG_OPPONENT_QUIT: {
+            const char *msg = "Opponent disconnected. You win!";
+            send_packet(myself->client_sd, RSP_ERROR, msg, strlen(msg) + 1);
             myself->status = IN_LOBBY;
             myself->current_game_id = -1;
             break;
+        }
             
         default: 
             break;
