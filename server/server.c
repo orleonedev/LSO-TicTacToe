@@ -34,6 +34,7 @@ int main(int argc, char *argv[]) {
     }
     server_state->player_head = NULL;
     server_state->game_head = NULL;
+    server_state->next_game_id = 1;
     pthread_mutex_init(&server_state->player_mutex, NULL);
     pthread_mutex_init(&server_state->game_mutex, NULL);
 
